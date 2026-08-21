@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+[[ $# -eq 1 ]] || { echo "Usage: obsi-configure-input /dev/input/by-id/...-event-kbd" >&2; exit 2; }
+
+selected=$1
+[[ $selected == /dev/input/by-id/*-event-kbd ]] || {
+  echo "select a stable /dev/input/by-id/*-event-kbd path" >&2
+  exit 1
+}
+[[ -e $selected ]] || { echo "input device does not exist: $selected" >&2; exit 1; }
+event=$(readlink -f -- "$selected")
+[[ $event == /dev/input/event* ]] || { echo "not an evdev event device" >&2; exit 1; }
+
+install -d -m 0755 /etc/obsi /etc/systemd/system/obsi-inputd.service.d
+escaped=${selected//\\/\\\\}
+escaped=${escaped//\"/\\\"}
+printf '{\n  "keyboard": "%s"\n}\n' "$escaped" >/etc/obsi/inputd.json
+cat >/etc/systemd/system/obsi-inputd.service.d/device.conf <<EOF
+[Service]
+DeviceAllow=$event r
+EOF
+
+systemctl daemon-reload
+systemctl enable --now obsi-inputd.service
+echo "OBSI input routing configured for $selected"
+

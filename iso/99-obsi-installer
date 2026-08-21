@@ -1,0 +1,2 @@
+user ALL=(root) NOPASSWD: /opt/obsi/installer/obsi-install.sh *
+user ALL=(root) NOPASSWD: /usr/bin/systemctl reboot

@@ -1,0 +1,42 @@
+@define-color obsi_bg #090d16;
+@define-color obsi_panel #101827;
+@define-color obsi_card #172237;
+@define-color obsi_accent #725cff;
+@define-color obsi_text #f5f7ff;
+@define-color obsi_muted #9aa8c1;
+
+* { font-family: "Inter", "Noto Sans", sans-serif; color: @obsi_text; }
+window { background: @obsi_bg; }
+.sidebar { background: #0d1422; padding: 28px 18px; min-width: 240px; }
+.brand { font-size: 28px; font-weight: 800; letter-spacing: 2px; }
+button.nav { background: transparent; border: 0; padding: 13px; border-radius: 10px; box-shadow: none; }
+button.nav:hover { background: rgba(255,255,255,.07); }
+.hint { color: @obsi_muted; font-size: 12px; padding: 12px; }
+.topbar { padding: 18px 28px; background: rgba(9,13,22,.92); border-bottom: 1px solid rgba(255,255,255,.07); }
+.top-title { font-size: 17px; font-weight: 600; }
+.status-pill { background: rgba(71,207,142,.13); color: #78e8ac; border-radius: 99px; padding: 7px 13px; }
+.page { padding: 34px 40px 48px 40px; }
+.page-title { font-size: 30px; font-weight: 800; }
+.subtitle, .muted { color: @obsi_muted; }
+.machine-card, .list-card, .storage-card { background: @obsi_card; border-radius: 16px; padding: 22px; border: 1px solid rgba(255,255,255,.07); }
+.machine-card { min-width: 300px; min-height: 190px; }
+.machine-card:hover, .list-card:hover { border-color: rgba(114,92,255,.65); }
+.card-title { font-size: 19px; font-weight: 700; }
+.machine-state { color: #78e8ac; font-weight: 600; }
+button.create-card { background: transparent; border: 2px dashed rgba(154,168,193,.4); border-radius: 16px; color: @obsi_muted; font-size: 18px; }
+button.create-card:hover { border-color: @obsi_accent; color: @obsi_text; }
+button.suggested-action { background: @obsi_accent; }
+button.warning { background: #d99431; color: #111; }
+.banner { background: #25334e; padding: 12px 28px; }
+.banner.error { background: #7c2635; }
+progressbar trough { min-height: 18px; background: #0b1120; border-radius: 99px; }
+progressbar progress { background: @obsi_accent; border-radius: 99px; }
+dialog, popover { background: @obsi_panel; }
+.installer { background: @obsi_bg; }
+.installer-top { padding: 24px 34px; background: #0d1422; }
+.installer-title { font-size: 34px; font-weight: 800; }
+.installer-warning { color: #ffc46b; background: rgba(217,148,49,.12); border-radius: 10px; padding: 14px; }
+.field-label { font-weight: 700; }
+.install-button { padding: 13px; font-size: 17px; }
+.error-text { color: #ff8799; }
+.install-log { background: #050810; color: #b8c4d9; padding: 14px; }

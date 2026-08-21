@@ -1,0 +1,12 @@
+[Unit]
+Description=OBSI managed NAT network
+After=libvirtd.service NetworkManager.service
+Requires=libvirtd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/obsi-network-setup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

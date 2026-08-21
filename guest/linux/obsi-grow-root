@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_source=$(findmnt -n -o SOURCE /)
+root_fstype=$(findmnt -n -o FSTYPE /)
+parent=$(lsblk -no PKNAME "$root_source")
+partition=$(lsblk -no PARTN "$root_source")
+
+[[ -n $parent && -n $partition ]] || {
+  echo "OBSI: root is not a simple partition; automatic growth skipped" >&2
+  exit 0
+}
+
+growpart "/dev/$parent" "$partition"
+case "$root_fstype" in
+  ext4) resize2fs "$root_source" ;;
+  xfs) xfs_growfs / ;;
+  *) echo "OBSI: unsupported root filesystem $root_fstype" >&2; exit 1 ;;
+esac
+

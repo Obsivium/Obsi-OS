@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""OBSI native LVM-thin storage manager and policy monitor."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("OBSI_PYTHON_PATH", "/usr/lib/obsi"))
+
+from obsi.thin import PolicyLevel, ThinPoolStatus, parse_map_allocated, parse_pool_report
+
+os.environ["LC_ALL"] = "C"
+VG = os.environ.get("OBSI_VG", "obsi-vg")
+POOL = os.environ.get("OBSI_THINPOOL", "obsi-thinpool")
+RUNTIME = Path(os.environ.get("OBSI_RUNTIME_DIR", "/run/obsi"))
+STATE_FILE = RUNTIME / "storage-status.json"
+LOCK_FILE = RUNTIME / "thin.lock"
+DEFAULT_VIRTUAL_SIZE = os.environ.get("OBSI_DEFAULT_VIRTUAL_SIZE", "900G")
+CONFIG_ROOT = Path(os.environ.get("OBSI_MACHINE_CONFIG_ROOT", "/etc/obsi/machines"))
+DENY_AT = 96.0
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
+SIZE_RE = re.compile(r"^([1-9][0-9]*)([GT])$")
+
+
+class StorageCommandError(RuntimeError):
+    pass
+
+
+def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            text=True,
+            capture_output=capture,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise StorageCommandError(detail or f"command failed: {command[0]}") from exc
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise StorageCommandError("this operation requires root")
+
+
+def valid_name(value: str, kind: str) -> str:
+    if not NAME_RE.fullmatch(value):
+        raise StorageCommandError(f"invalid {kind} name")
+    return value
+
+
+def valid_virtual_size(value: str) -> str:
+    match = SIZE_RE.fullmatch(value.upper())
+    if not match:
+        raise StorageCommandError("virtual size must use a whole G or T unit")
+    amount = int(match.group(1)) * (1024 if match.group(2) == "T" else 1)
+    if not 50 <= amount <= 16 * 1024:
+        raise StorageCommandError("virtual size must be between 50G and 16T")
+    return value.upper()
+
+
+def pool_status() -> ThinPoolStatus:
+    result = run(
+        [
+            "lvs",
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "vg_name,lv_name,lv_size,data_percent,metadata_percent,whenfull,lv_attr",
+            f"{VG}/{POOL}",
+        ],
+        capture=True,
+    )
+    return parse_pool_report(result.stdout, expected_vg=VG, expected_pool=POOL)
+
+
+def write_payload(payload: dict) -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    payload = payload | {"updated_unix": int(time.time())}
+    fd, temporary = tempfile.mkstemp(prefix="storage-status.", dir=RUNTIME)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, STATE_FILE)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def write_state(status: ThinPoolStatus) -> None:
+    write_payload(status.as_json())
+
+
+def write_failure(reason: str) -> None:
+    write_payload(
+        {
+            "level": "failed",
+            "reason": reason,
+            "can_start": False,
+        }
+    )
+
+
+def ensure_allowed() -> ThinPoolStatus:
+    status = pool_status()
+    write_state(status)
+    if not status.can_start:
+        raise StorageCommandError(
+            f"storage denied: data={status.data_percent:.2f}% "
+            f"metadata={status.metadata_percent:.2f}% ({status.reason})"
+        )
+    return status
+
+
+def thin_lv(prefix: str, name: str) -> str:
+    return f"{prefix}-{valid_name(name, prefix)}"
+
+
+def lv_size_bytes(name: str) -> int:
+    result = run(
+        [
+            "lvs",
+            "--noheadings",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "lv_size",
+            f"{VG}/{name}",
+        ],
+        capture=True,
+    )
+    try:
+        return int(float(result.stdout.strip()))
+    except ValueError as exc:
+        raise StorageCommandError("invalid LVM volume size") from exc
+
+
+def write_machine_config(machine: str, template: str, lv: str) -> Path:
+    CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    destination = CONFIG_ROOT / f"{machine}.json"
+    if destination.exists():
+        raise StorageCommandError("machine config already exists")
+    payload = {
+        "backend": "lvmthin",
+        "disk": f"/dev/{VG}/{lv}",
+        "template": template,
+        "virtual_gib": lv_size_bytes(lv) // 1024**3,
+    }
+    fd, temporary = tempfile.mkstemp(prefix=f".{machine}.", dir=CONFIG_ROOT)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def lv_exists(name: str) -> bool:
+    result = subprocess.run(
+        ["lvs", "--noheadings", f"{VG}/{name}"],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def relocate_backup_gpt(device: str) -> None:
+    probe = subprocess.run(
+        ["blkid", "-p", "-s", "PTTYPE", "-o", "value", device],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if probe.stdout.strip() == "gpt":
+        run(["sgdisk", "--move-second-header", device])
+
+
+def image_allocated_bytes(source: Path) -> int:
+    result = run(
+        ["qemu-img", "map", "--output=json", str(source)],
+        capture=True,
+    )
+    try:
+        return parse_map_allocated(result.stdout)
+    except ValueError as exc:
+        raise StorageCommandError("qemu-img returned an invalid allocation map") from exc
+
+
+def command_status(as_json: bool) -> int:
+    status = pool_status()
+    write_state(status)
+    if as_json:
+        print(json.dumps(status.as_json(), indent=2))
+    else:
+        gib = 1024**3
+        print(
+            f"OBSI Pool: {status.level.name} | data {status.data_percent:.2f}% | "
+            f"metadata {status.metadata_percent:.2f}% | when-full {status.when_full}"
+        )
+        print(
+            f"physical: {status.size_bytes / gib:.1f} GiB total | "
+            f"{status.used_bytes / gib:.1f} GiB used | {status.free_bytes / gib:.1f} GiB free"
+        )
+        print(status.reason)
+    return 0 if status.level < PolicyLevel.FAILED else 2
+
+
+def command_can_start() -> int:
+    status = ensure_allowed()
+    print(
+        f"allowed: data={status.data_percent:.2f}% metadata={status.metadata_percent:.2f}%"
+    )
+    return 0
+
+
+def managed_volumes() -> list[dict]:
+    result = run(
+        [
+            "lvs",
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "lv_name,lv_size,data_percent,origin,pool_lv,lv_tags",
+            VG,
+        ],
+        capture=True,
+    )
+    try:
+        reports = json.loads(result.stdout)["report"]
+        rows = [row for report in reports for row in report.get("lv", [])]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise StorageCommandError("invalid LVM volume report") from exc
+    managed = [
+        row
+        for row in rows
+        if str(row.get("lv_name", "")).strip().startswith(("tpl-", "vm-"))
+    ]
+    return sorted(managed, key=lambda item: str(item.get("lv_name", "")))
+
+
+def command_list(as_json: bool) -> int:
+    managed = managed_volumes()
+    if as_json:
+        payload = []
+        for row in managed:
+            name = str(row.get("lv_name", "")).strip()
+            payload.append(
+                {
+                    "name": name,
+                    "kind": "template" if name.startswith("tpl-") else "machine",
+                    "id": name[4:] if name.startswith("tpl-") else name[3:],
+                    "virtual_bytes": int(float(str(row.get("lv_size", "0")).strip() or 0)),
+                    "mapped_percent": float(str(row.get("data_percent", "0")).strip() or 0),
+                    "origin": str(row.get("origin", "")).strip() or None,
+                }
+            )
+        print(json.dumps(payload, indent=2))
+        return 0
+    for row in managed:
+        name = str(row.get("lv_name", "")).strip()
+        size_gib = float(str(row.get("lv_size", "0")).strip() or 0) / 1024**3
+        mapped = str(row.get("data_percent", "")).strip() or "0"
+        origin = str(row.get("origin", "")).strip() or "-"
+        print(f"{name:32} virtual={size_gib:.0f}GiB mapped={mapped}% origin={origin}")
+    return 0
+
+
+def command_remove_machine(machine: str, confirm: bool) -> int:
+    require_root()
+    machine = valid_name(machine, "machine")
+    if not confirm:
+        raise StorageCommandError("--confirm is required to remove a machine")
+    target = thin_lv("vm", machine)
+    config = CONFIG_ROOT / f"{machine}.json"
+    if not lv_exists(target) and not config.exists():
+        raise StorageCommandError("machine does not exist")
+    if lv_exists(target):
+        run(["lvchange", "--activate", "n", f"{VG}/{target}"])
+        run(["lvremove", "--yes", f"{VG}/{target}"])
+    config.unlink(missing_ok=True)
+    print(f"machine removed: {machine}")
+    return 0
+
+
+def command_create_template(name: str, virtual_size: str) -> int:
+    require_root()
+    ensure_allowed()
+    lv = thin_lv("tpl", name)
+    virtual_size = valid_virtual_size(virtual_size)
+    if lv_exists(lv):
+        raise StorageCommandError("template already exists")
+    run(
+        [
+            "lvcreate",
+            "--type",
+            "thin",
+            "--name",
+            lv,
+            "--virtualsize",
+            virtual_size,
+            "--thinpool",
+            POOL,
+            "--addtag",
+            "obsi.template",
+            VG,
+        ]
+    )
+    print(f"/dev/{VG}/{lv}")
+    return 0
+
+
+def command_import_template(name: str, source: Path, virtual_size: str) -> int:
+    require_root()
+    if not source.is_file():
+        raise StorageCommandError("source image does not exist")
+    source = source.resolve()
+    status = ensure_allowed()
+    required = image_allocated_bytes(source)
+    budget = int(status.size_bytes * max(0.0, DENY_AT - status.data_percent) / 100)
+    if int(required * 1.10) > budget:
+        raise StorageCommandError(
+            "source image plus safety margin would cross the 96% data threshold"
+        )
+    command_create_template(name, virtual_size)
+    lv = thin_lv("tpl", name)
+    device = f"/dev/{VG}/{lv}"
+    try:
+        run(["qemu-img", "convert", "-p", "-n", "-O", "raw", str(source), device])
+        relocate_backup_gpt(device)
+        run(["lvchange", "--activate", "n", f"{VG}/{lv}"])
+        run(["lvchange", "--setautoactivation", "n", f"{VG}/{lv}"])
+        run(["lvchange", "--permission", "r", f"{VG}/{lv}"])
+    except Exception:
+        subprocess.run(["lvremove", "--yes", f"{VG}/{lv}"], check=False)
+        raise
+    print(f"template finalized: {device}")
+    return 0
+
+
+def command_finalize_template(name: str) -> int:
+    require_root()
+    lv = thin_lv("tpl", name)
+    if not lv_exists(lv):
+        raise StorageCommandError("template does not exist")
+    run(["lvchange", "--activate", "n", f"{VG}/{lv}"])
+    run(["lvchange", "--setautoactivation", "n", f"{VG}/{lv}"])
+    run(["lvchange", "--permission", "r", f"{VG}/{lv}"])
+    print(f"template finalized: /dev/{VG}/{lv}")
+    return 0
+
+
+def command_clone(template: str, machine: str) -> int:
+    require_root()
+    ensure_allowed()
+    origin = thin_lv("tpl", template)
+    target = thin_lv("vm", machine)
+    if not lv_exists(origin):
+        raise StorageCommandError("template does not exist")
+    if lv_exists(target):
+        raise StorageCommandError("machine volume already exists")
+    if (CONFIG_ROOT / f"{machine}.json").exists():
+        raise StorageCommandError("machine config already exists")
+    try:
+        run(
+            [
+                "lvcreate",
+                "--snapshot",
+                "--name",
+                target,
+                "--setactivationskip",
+                "n",
+                "--setautoactivation",
+                "n",
+                "--addtag",
+                "obsi.machine",
+                f"{VG}/{origin}",
+            ]
+        )
+        run(["lvchange", "--permission", "rw", f"{VG}/{target}"])
+        config = write_machine_config(machine, template, target)
+    except Exception:
+        if lv_exists(target):
+            subprocess.run(["lvremove", "--yes", f"{VG}/{target}"], check=False)
+        raise
+    print(f"/dev/{VG}/{target}")
+    print(config)
+    return 0
+
+
+def command_activate_machine(machine: str) -> int:
+    require_root()
+    ensure_allowed()
+    target = thin_lv("vm", machine)
+    if not lv_exists(target):
+        raise StorageCommandError("machine volume does not exist")
+    run(["lvchange", "--activate", "y", "--ignoreactivationskip", f"{VG}/{target}"])
+    return 0
+
+
+def command_deactivate_machine(machine: str) -> int:
+    require_root()
+    target = thin_lv("vm", machine)
+    if not lv_exists(target):
+        raise StorageCommandError("machine volume does not exist")
+    run(["lvchange", "--activate", "n", f"{VG}/{target}"])
+    return 0
+
+
+def command_use_emergency(confirm: bool) -> int:
+    require_root()
+    if not confirm:
+        raise StorageCommandError("--confirm is required to consume the emergency reserve")
+    status = pool_status()
+    if status.level < PolicyLevel.CRITICAL:
+        raise StorageCommandError("emergency reserve is available only at CRITICAL or DENY")
+    emergency = f"{VG}/obsi-emergency"
+    if not lv_exists("obsi-emergency"):
+        raise StorageCommandError("emergency reserve has already been consumed")
+    run(["lvremove", "--yes", emergency])
+    run(["lvextend", "--extents", "+100%FREE", f"{VG}/{POOL}"])
+    run(["lvchange", "--monitor", "y", f"{VG}/{POOL}"])
+    updated = pool_status()
+    write_state(updated)
+    print(
+        f"emergency reserve added: data={updated.data_percent:.2f}% "
+        f"metadata={updated.metadata_percent:.2f}%"
+    )
+    return 0
+
+
+def command_monitor(interval: float) -> int:
+    require_root()
+    logging.basicConfig(level=logging.INFO, format="obsi-storaged: %(message)s")
+    previous: PolicyLevel | None = None
+    while True:
+        try:
+            status = pool_status()
+            write_state(status)
+            if status.level != previous:
+                log = logging.warning if status.level >= PolicyLevel.WARN else logging.info
+                log(
+                    "%s data=%.2f%% metadata=%.2f%%: %s",
+                    status.level.name,
+                    status.data_percent,
+                    status.metadata_percent,
+                    status.reason,
+                )
+                previous = status.level
+        except Exception as exc:
+            try:
+                write_failure(str(exc))
+            except OSError:
+                pass
+            if previous != PolicyLevel.FAILED:
+                logging.error("FAILED: %s", exc)
+                previous = PolicyLevel.FAILED
+        time.sleep(interval)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    status = commands.add_parser("status")
+    status.add_argument("--json", action="store_true")
+    commands.add_parser("can-start")
+    listed = commands.add_parser("list")
+    listed.add_argument("--json", action="store_true")
+
+    create = commands.add_parser("create-template")
+    create.add_argument("name")
+    create.add_argument("--virtual-size", default=DEFAULT_VIRTUAL_SIZE)
+
+    imported = commands.add_parser("import-template")
+    imported.add_argument("name")
+    imported.add_argument("source", type=Path)
+    imported.add_argument("--virtual-size", default=DEFAULT_VIRTUAL_SIZE)
+
+    finalize = commands.add_parser("finalize-template")
+    finalize.add_argument("name")
+
+    clone = commands.add_parser("clone")
+    clone.add_argument("template")
+    clone.add_argument("machine")
+
+    activate = commands.add_parser("activate-machine")
+    activate.add_argument("machine")
+
+    deactivate = commands.add_parser("deactivate-machine")
+    deactivate.add_argument("machine")
+
+    remove = commands.add_parser("remove-machine")
+    remove.add_argument("machine")
+    remove.add_argument("--confirm", action="store_true")
+
+    emergency = commands.add_parser("use-emergency-reserve")
+    emergency.add_argument("--confirm", action="store_true")
+
+    monitor = commands.add_parser("monitor")
+    monitor.add_argument("--interval", type=float, default=2.0)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    try:
+        with LOCK_FILE.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if args.command == "status":
+                return command_status(args.json)
+            if args.command == "can-start":
+                return command_can_start()
+            if args.command == "list":
+                return command_list(args.json)
+            if args.command == "create-template":
+                return command_create_template(args.name, args.virtual_size)
+            if args.command == "import-template":
+                return command_import_template(args.name, args.source, args.virtual_size)
+            if args.command == "finalize-template":
+                return command_finalize_template(args.name)
+            if args.command == "clone":
+                return command_clone(args.template, args.machine)
+            if args.command == "activate-machine":
+                return command_activate_machine(args.machine)
+            if args.command == "deactivate-machine":
+                return command_deactivate_machine(args.machine)
+            if args.command == "remove-machine":
+                return command_remove_machine(args.machine, args.confirm)
+            if args.command == "use-emergency-reserve":
+                return command_use_emergency(args.confirm)
+            if args.command == "monitor":
+                # Do not retain an exclusive command lock for the lifetime of the monitor.
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                return command_monitor(max(0.5, args.interval))
+    except (StorageCommandError, OSError, ValueError) as exc:
+        print(f"obsi-storage: {exc}", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

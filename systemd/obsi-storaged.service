@@ -1,0 +1,20 @@
+[Unit]
+Description=OBSI native thin-pool policy monitor
+After=lvm2-monitor.service
+Requires=lvm2-monitor.service
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/lvchange --activate y obsi-vg/obsi-thinpool
+ExecStartPre=/sbin/lvchange --monitor y obsi-vg/obsi-thinpool
+ExecStart=/usr/bin/obsi-storage monitor --interval 2
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/obsi -/run/lock/lvm -/etc/lvm/archive -/etc/lvm/backup
+
+[Install]
+WantedBy=multi-user.target

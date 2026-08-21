@@ -1,0 +1,1 @@
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="OBSI Guest Keyboard", SYMLINK+="input/by-id/obsi-guest-keyboard", GROUP="libvirt-qemu", MODE="0660"

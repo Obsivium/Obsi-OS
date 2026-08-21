@@ -1,0 +1,23 @@
+[Unit]
+Description=OBSI physical input router and emergency workspace hotkey
+After=systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-modules-load.service systemd-udev-settle.service
+ConditionPathExists=/etc/obsi/inputd.json
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/obsi/inputd.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/obsi -/dev/uinput
+DevicePolicy=closed
+DeviceAllow=/dev/uinput rw
+# The selected event device requires a generated DeviceAllow line in a hardware
+# profile drop-in. The installer GUI will create that after keyboard selection.
+
+[Install]
+WantedBy=multi-user.target

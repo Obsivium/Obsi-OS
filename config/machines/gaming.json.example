@@ -1,0 +1,6 @@
+{
+  "backend": "lvmthin",
+  "disk": "/dev/obsi-vg/vm-gaming",
+  "template": "windows11-clean",
+  "virtual_gib": 900
+}

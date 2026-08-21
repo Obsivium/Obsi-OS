@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+guest=${1:-}
+operation=${2:-}
+phase=${3:-}
+config="/etc/obsi/machines/$guest.json"
+active=/run/obsi/active-machine
+
+if [[ $operation == prepare && $phase == begin && -f $config ]]; then
+  /usr/bin/obsi-prestart "$guest"
+fi
+
+if [[ $operation == release && $phase == end && -f $active ]]; then
+  current=$(tr -d '\r\n' <"$active")
+  if [[ $current == "$guest" ]]; then
+    rm -f -- "$active"
+  fi
+fi
+
+if [[ $operation == release && $phase == end && -f $config ]]; then
+  /usr/bin/obsi-storage deactivate-machine "$guest" || true
+fi
+
+# Hook XML from stdin is intentionally left unmodified. An empty stdout means
+# identity for libvirt's hook filter chain.
+exit 0

@@ -1,0 +1,43 @@
+<domain type='kvm'>
+  <name>gaming</name>
+  <memory unit='GiB'>16</memory>
+  <vcpu placement='static'>8</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='yes' name='secure-boot'/>
+    </firmware>
+  </os>
+  <features><acpi/><apic/><smm state='on'/></features>
+  <cpu mode='host-passthrough' check='none'/>
+  <devices>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='native' discard='unmap'/>
+      <source dev='/dev/obsi-vg/vm-gaming'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+    <input type='keyboard' bus='virtio'/>
+    <input type='mouse' bus='virtio'/>
+    <input type='evdev'>
+      <source dev='/dev/input/by-id/obsi-guest-keyboard' grab='all' repeat='on'/>
+    </input>
+    <!-- Replace both PCI addresses with the dGPU graphics/audio functions. -->
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source><address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/></source>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source><address domain='0x0000' bus='0x01' slot='0x00' function='0x1'/></source>
+    </hostdev>
+    <video><model type='none'/></video>
+  </devices>
+</domain>

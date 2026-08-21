@@ -1,0 +1,20 @@
+[Unit]
+Description=OBSI privileged workstation core
+After=libvirtd.service obsi-storaged.service obsi-network.service
+Requires=libvirtd.service obsi-storaged.service obsi-network.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/obsi-core
+Restart=on-failure
+RestartSec=2
+UMask=0007
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
